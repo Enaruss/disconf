@@ -10,7 +10,7 @@ Disconf
 4. 不要再使用其他PropertySourcesPlaceholderConfigurer来引入本地配置文件
 
 # demo
-
+springboot1、2按如下进行注解式配置：
 ```Java
 @Configuration
 @EnableAspectJAutoProxy(proxyTargetClass = true)
