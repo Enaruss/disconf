@@ -26,7 +26,10 @@ import org.springframework.beans.factory.config.BeanDefinitionVisitor;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextAware;
+import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
+import org.springframework.core.env.ConfigurablePropertyResolver;
 import org.springframework.util.ObjectUtils;
+import org.springframework.util.PropertyPlaceholderHelper;
 import org.springframework.util.StringValueResolver;
 
 /**
@@ -37,11 +40,11 @@ import org.springframework.util.StringValueResolver;
  * 2. 当动态config变动时，此configurer会进行reload
  * 3. reload 时会 compare config value, and set value for beans
  */
-public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlaceholderConfigurer implements
+public class ReloadingPropertyPlaceholderConfigurer extends PropertySourcesPlaceholderConfigurer implements
         InitializingBean, DisposableBean, IReloadablePropertiesListener, ApplicationContextAware {
 
     protected static final Logger logger = LoggerFactory.getLogger(ReloadingPropertyPlaceholderConfigurer.class);
-
+    protected static final String DEFAULT_DEFAULT_SEPARATOR = "=";
     // 默认的 property 标识符
     private String placeholderPrefix = DEFAULT_PLACEHOLDER_PREFIX;
 
@@ -51,7 +54,56 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
 
     private BeanFactory beanFactory;
     private Properties[] propertiesArray;
+    
+	/**
+	 * extract the placeholder name from the complete placeholder string (between
+	 * prefix and separator, or complete placeholder if no separator is found).
+	 *
+	 * @param placeholderWithDefault default placeholder
+	 *
+	 * @return the placeholder
+	 *
+	 * @see #setPlaceholderPrefix
+	 * @see #setDefaultSeparator
+	 * @see #setPlaceholderSuffix
+	 */
+	protected final String getPlaceholder(final String placeholderWithDefault) {
+		int separatorIdx = placeholderWithDefault.indexOf(DEFAULT_DEFAULT_SEPARATOR);
+		if (separatorIdx == -1) {
+			return placeholderWithDefault;
+		}
+		return placeholderWithDefault.substring(0, separatorIdx);
+	}
+	
+	private void recordDynamicPlaceholders(String strVal) {
+		DynamicProperty dynamic = null;
 
+		// replace reloading prefix and suffix by "normal" prefix and suffix.
+		// remember all the "dynamic" placeholders encountered.
+		StringBuffer buf = new StringBuffer(strVal);
+		int startIndex = strVal.indexOf(this.placeholderPrefix);
+		while (startIndex != -1) {
+			int endIndex = buf.toString().indexOf(this.placeholderSuffix, startIndex + this.placeholderPrefix.length());
+			if (endIndex != -1) {
+				if (currentBeanName != null && currentPropertyName != null) {
+					String placeholder = buf.substring(startIndex + this.placeholderPrefix.length(), endIndex);
+					placeholder = getPlaceholder(placeholder);
+					if (dynamic == null) {
+						dynamic = getDynamic(currentBeanName, currentPropertyName, strVal);
+					}
+					addDependency(dynamic, placeholder);
+				} else {
+					logger.debug("dynamic property outside bean property value - ignored: " + strVal);
+				}
+				startIndex = endIndex - this.placeholderPrefix.length() + this.placeholderPrefix.length()
+						+ this.placeholderSuffix.length();
+				startIndex = strVal.indexOf(this.placeholderPrefix, startIndex);
+			} else {
+				startIndex = -1;
+			}
+		}
+	}
+	
     /**
      * 对于被标记为动态的，进行 构造 property dependency
      * 非动态的，则由原来的spring进行处理
@@ -64,39 +116,29 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
      *
      * @throws BeanDefinitionStoreException
      */
-    protected String parseStringValue(String strVal, Properties props, Set visitedPlaceholders)
+    protected String parseStringValue(String strVal, Properties props)
             throws BeanDefinitionStoreException {
-
-        DynamicProperty dynamic = null;
-
-        // replace reloading prefix and suffix by "normal" prefix and suffix.
-        // remember all the "dynamic" placeholders encountered.
-        StringBuffer buf = new StringBuffer(strVal);
-        int startIndex = strVal.indexOf(this.placeholderPrefix);
-        while (startIndex != -1) {
-            int endIndex = buf.toString().indexOf(this.placeholderSuffix, startIndex + this.placeholderPrefix.length());
-            if (endIndex != -1) {
-                if (currentBeanName != null && currentPropertyName != null) {
-                    String placeholder = buf.substring(startIndex + this.placeholderPrefix.length(), endIndex);
-                    placeholder = getPlaceholder(placeholder);
-                    if (dynamic == null) {
-                        dynamic = getDynamic(currentBeanName, currentPropertyName, strVal);
-                    }
-                    addDependency(dynamic, placeholder);
-                } else {
-                    logger.debug("dynamic property outside bean property value - ignored: " + strVal);
-                }
-                startIndex = endIndex - this.placeholderPrefix.length() + this.placeholderPrefix.length() +
-                        this.placeholderSuffix.length();
-                startIndex = strVal.indexOf(this.placeholderPrefix, startIndex);
-            } else {
-                startIndex = -1;
-            }
-        }
-        // then, business as usual. no recursive reloading placeholders please.
-        return super.parseStringValue(buf.toString(), props, visitedPlaceholders);
+    	recordDynamicPlaceholders(strVal);
+		// then, business as usual. no recursive reloading placeholders please.
+		PropertyPlaceholderHelper helper = new PropertyPlaceholderHelper(placeholderPrefix, placeholderSuffix,
+				valueSeparator, ignoreUnresolvablePlaceholders);
+		return helper.replacePlaceholders(strVal, props);
     }
 
+	protected String parseStringValue(final String strVal, final ConfigurablePropertyResolver propertyResolver)
+			throws BeanDefinitionStoreException {
+		recordDynamicPlaceholders(strVal);
+		propertyResolver.setPlaceholderPrefix(this.placeholderPrefix);
+		propertyResolver.setPlaceholderSuffix(this.placeholderSuffix);
+		propertyResolver.setValueSeparator(this.valueSeparator);
+		String resolved = (this.ignoreUnresolvablePlaceholders ? propertyResolver.resolvePlaceholders(strVal)
+				: propertyResolver.resolveRequiredPlaceholders(strVal));
+		if (resolved != null) {
+			resolved = resolved.trim();
+		}
+		return (resolved.equals(this.nullValue) ? null : resolved);
+	}
+	
     /**
      * @param currentBeanName     当前的bean name
      * @param currentPropertyName 当前它的属性
@@ -123,6 +165,7 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
      *
      * @throws IOException
      */
+    @Override
     protected Properties mergeProperties() throws IOException {
         Properties properties = super.mergeProperties();
         this.lastMergedProperties = properties;
@@ -134,6 +177,7 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
      *
      * @param event
      */
+    @Override
     public void propertiesReloaded(PropertiesReloadedEvent event) {
 
         Properties oldProperties = lastMergedProperties;
@@ -218,7 +262,7 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
                     currentBeanName = beanName;
                     currentPropertyName = propertyName;
                     try {
-                        newValue = parseStringValue(unparsedValue, newProperties, new HashSet());
+                        newValue = parseStringValue(unparsedValue, newProperties);
                     } finally {
                         currentBeanName = null;
                         currentPropertyName = null;
@@ -364,11 +408,13 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
      * copy & paste, just so we can insert our own visitor.
      * 启动时 进行配置的解析
      */
-    protected void processProperties(ConfigurableListableBeanFactory beanFactoryToProcess, Properties props)
+    @Override
+    protected void processProperties(ConfigurableListableBeanFactory beanFactoryToProcess,
+			final ConfigurablePropertyResolver propertyResolver)
             throws BeansException {
 
         BeanDefinitionVisitor visitor =
-                new ReloadingPropertyPlaceholderConfigurer.PlaceholderResolvingBeanDefinitionVisitor(props);
+                new ReloadingPropertyPlaceholderConfigurer.PlaceholderResolvingBeanDefinitionVisitor(propertyResolver);
         String[] beanNames = beanFactoryToProcess.getBeanDefinitionNames();
         for (int i = 0; i < beanNames.length; i++) {
             // Check that we're not parsing our own bean definition,
@@ -390,7 +436,7 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
             }
         }
 
-        StringValueResolver stringValueResolver = new PlaceholderResolvingStringValueResolver(props);
+        StringValueResolver stringValueResolver = new ReloadingPropertyPlaceholderConfigurer.PlaceholderResolvingStringValueResolver(propertyResolver);
 
         // New in Spring 2.5: resolve placeholders in alias target names and aliases as well.
         beanFactoryToProcess.resolveAliases(stringValueResolver);
@@ -403,6 +449,7 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
      * afterPropertiesSet
      * 将自己 添加 property listener
      */
+    @Override
     public void afterPropertiesSet() {
         for (Properties properties : propertiesArray) {
             if (properties instanceof ReloadableProperties) {
@@ -418,6 +465,7 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
      *
      * @throws Exception
      */
+    @Override
     public void destroy() throws Exception {
         for (Properties properties : propertiesArray) {
             if (properties instanceof ReloadableProperties) {
@@ -430,84 +478,85 @@ public class ReloadingPropertyPlaceholderConfigurer extends DefaultPropertyPlace
     /**
      * 替换掉spring的 config resolver，这样我们才可以解析掉自己的config
      */
-    private class PlaceholderResolvingBeanDefinitionVisitor extends BeanDefinitionVisitor {
+	private class PlaceholderResolvingBeanDefinitionVisitor extends BeanDefinitionVisitor {
+		private final ConfigurablePropertyResolver propertyResolver;
 
-        private final Properties props;
+		public PlaceholderResolvingBeanDefinitionVisitor(ConfigurablePropertyResolver propertyResolver) {
+			this.propertyResolver = propertyResolver;
+		}
 
-        public PlaceholderResolvingBeanDefinitionVisitor(Properties props) {
-            this.props = props;
-        }
+		@Override
+		protected void visitPropertyValues(MutablePropertyValues pvs) {
+			PropertyValue[] pvArray = pvs.getPropertyValues();
+			for (PropertyValue pv : pvArray) {
+				currentPropertyName = pv.getName();
+				try {
+					Object newVal = resolveValue(pv.getValue());
+					if (!ObjectUtils.nullSafeEquals(newVal, pv.getValue())) {
+						pvs.addPropertyValue(pv.getName(), newVal);
+					}
+				} finally {
+					currentPropertyName = null;
+				}
+			}
+		}
 
-        protected void visitPropertyValues(MutablePropertyValues pvs) {
-            PropertyValue[] pvArray = pvs.getPropertyValues();
-            for (PropertyValue pv : pvArray) {
-                currentPropertyName = pv.getName();
-                try {
-                    Object newVal = resolveValue(pv.getValue());
-                    if (!ObjectUtils.nullSafeEquals(newVal, pv.getValue())) {
-                        pvs.addPropertyValue(pv.getName(), newVal);
-                    }
-                } finally {
-                    currentPropertyName = null;
-                }
-            }
-        }
-
-        protected String resolveStringValue(String strVal) throws BeansException {
-            return parseStringValue(strVal, this.props, new HashSet());
-        }
-    }
+		@Override
+		protected String resolveStringValue(String strVal) throws BeansException {
+			String newVal = parseStringValue(strVal, this.propertyResolver);
+			return (strVal.equals(newVal) ? strVal : newVal);
+		}
+	}
 
     /**
      *
      */
-    protected class PlaceholderResolvingStringValueResolver implements StringValueResolver {
+	protected class PlaceholderResolvingStringValueResolver implements StringValueResolver {
+		private final ConfigurablePropertyResolver propertyResolver;
 
-        private final Properties props;
+		public PlaceholderResolvingStringValueResolver(ConfigurablePropertyResolver propertyResolver) {
+			this.propertyResolver = propertyResolver;
+		}
 
-        public PlaceholderResolvingStringValueResolver(Properties props) {
-            this.props = props;
-        }
-
-        @Override
-        public String resolveStringValue(String strVal) throws BeansException {
-            return parseStringValue(strVal, this.props, new HashSet());
-        }
-    }
+		@Override
+		public String resolveStringValue(String strVal) throws BeansException {
+			return parseStringValue(strVal, this.propertyResolver);
+		}
+	}
 
     /**
      * the application context is needed to find the beans again during reconfiguration
      */
     private ApplicationContext applicationContext;
-
+    @Override
     public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
         this.applicationContext = applicationContext;
     }
-
+    @Override
     public void setProperties(Properties properties) {
         setPropertiesArray(new Properties[] {properties});
     }
-
-    public void setPropertiesArray(Properties[] propertiesArray) {
+    @Override
+    public void setPropertiesArray(Properties... propertiesArray) {
         this.propertiesArray = propertiesArray;
         super.setPropertiesArray(propertiesArray);
     }
-
+    @Override
     public void setPlaceholderPrefix(String placeholderPrefix) {
         this.placeholderPrefix = placeholderPrefix;
         super.setPlaceholderPrefix(placeholderPrefix);
     }
-
+    @Override
     public void setPlaceholderSuffix(String placeholderSuffix) {
         this.placeholderSuffix = placeholderSuffix;
         super.setPlaceholderSuffix(placeholderPrefix);
     }
-
+    @Override
     public void setBeanName(String beanName) {
         this.beanName = beanName;
         super.setBeanName(beanName);
     }
-
+    @Override
     public void setBeanFactory(BeanFactory beanFactory) {
         this.beanFactory = beanFactory;
         super.setBeanFactory(beanFactory);
