@@ -10,7 +10,8 @@ Disconf
 4. 不要再使用其他PropertySourcesPlaceholderConfigurer来引入本地配置文件
 
 # demo
-'''
+'''Java
+
 @Configuration
 @EnableAspectJAutoProxy(proxyTargetClass = true)
 public class ApplicationConfig {
